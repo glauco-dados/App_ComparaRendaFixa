@@ -141,6 +141,18 @@ def taxa_composta(taxa_a: float, taxa_b: float) -> float:
     return (1 + taxa_a) * (1 + taxa_b) - 1
 
 
+def spread_sobre_indice(taxa_total_aa: float, indice_aa: float) -> float:
+    """Taxa adicional decimal tal que (1 + indice) * (1 + spread) - 1 = taxa_total."""
+    return (1 + taxa_total_aa) / (1 + indice_aa) - 1
+
+
+def percentual_sobre_indice(taxa_total_aa: float, indice_aa: float) -> float:
+    """Percentual decimal do índice equivalente a uma taxa total (ex.: 1.12 = 112% do CDI)."""
+    if indice_aa == 0:
+        return 0.0
+    return taxa_total_aa / indice_aa
+
+
 def calcula_custodia_tesouro(
     valor_inicial: float,
     taxa_aa: float,
@@ -642,11 +654,22 @@ serie = serie_temporal_valor_liquido(
     aplicar_isencao_selic_10k=aplicar_isencao_selic_10k,
 )
 
+MESES_PT_ABREV = "['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']"
+
 grafico_valor_liquido = (
     alt.Chart(serie)
-    .mark_line(point=True)
+    .mark_line(
+        interpolate="monotone",
+        strokeWidth=1.6,
+        opacity=0.9,
+        point=alt.OverlayMarkDef(size=16, filled=True, opacity=0.55),
+    )
     .encode(
-        x=alt.X("Data:T", title="Data"),
+        x=alt.X(
+            "Data:T",
+            title="Data",
+            axis=alt.Axis(labelExpr=f"{MESES_PT_ABREV}[month(datum.value)] + ' ' + year(datum.value)"),
+        ),
         y=alt.Y(
             "Valor Líquido:Q",
             title="Valor Líquido (R$)",
@@ -669,9 +692,33 @@ base_lci = df[df["Produto"] == rotulo_lci].iloc[0]
 cdb_equiv = taxa_bruta_por_taxa_liquida("CDB", base_lci["Taxa Líquida a.a."], valor_inicial, DU, DC, taxa_custodia_aa, produto_tesouro, aplicar_isencao_selic_10k)
 tesouro_equiv = taxa_bruta_por_taxa_liquida("TESOURO", base_lci["Taxa Líquida a.a."], valor_inicial, DU, DC, taxa_custodia_aa, produto_tesouro, aplicar_isencao_selic_10k)
 
+rotulo_cdb_equiv = "CDB bruto equivalente à LCI"
+valor_cdb_equiv = formata_pct(cdb_equiv)
+rotulo_tesouro_equiv = f"{produto_tesouro} bruto equivalente à LCI"
+valor_tesouro_equiv = formata_pct(tesouro_equiv)
+
+if modo == "Informar taxa bruta" and indexador_lci == "CDI":
+    cdi_aa_ref = busca_cdi_aa()
+    if cdi_aa_ref is None and "lci_cdi_manual" in st.session_state:
+        cdi_aa_ref = pct_to_decimal(st.session_state["lci_cdi_manual"])
+    if cdi_aa_ref:
+        rotulo_cdb_equiv = "CDB equivalente à LCI"
+        valor_cdb_equiv = f"{formata_pct(percentual_sobre_indice(cdb_equiv, cdi_aa_ref))} do CDI"
+        if produto_tesouro == "Tesouro Selic" and "tesouro_selic_taxa" in st.session_state:
+            selic_ref = pct_to_decimal(st.session_state["tesouro_selic_taxa"])
+            rotulo_tesouro_equiv = "Tesouro Selic equivalente à LCI"
+            valor_tesouro_equiv = f"Selic + {formata_pct(spread_sobre_indice(tesouro_equiv, selic_ref))}"
+elif modo == "Informar taxa bruta" and indexador_lci == "IPCA+" and "lci_ipca_est" in st.session_state:
+    ipca_ref = pct_to_decimal(st.session_state["lci_ipca_est"])
+    rotulo_cdb_equiv = "CDB equivalente à LCI"
+    valor_cdb_equiv = f"IPCA + {formata_pct(spread_sobre_indice(cdb_equiv, ipca_ref))}"
+    if produto_tesouro == "Tesouro IPCA+":
+        rotulo_tesouro_equiv = "Tesouro IPCA+ equivalente à LCI"
+        valor_tesouro_equiv = f"IPCA + {formata_pct(spread_sobre_indice(tesouro_equiv, ipca_ref))}"
+
 col_a, col_b = st.columns(2)
-col_a.metric("CDB bruto equivalente à LCI", formata_pct(cdb_equiv))
-col_b.metric(f"{produto_tesouro} bruto equivalente à LCI", formata_pct(tesouro_equiv))
+col_a.metric(rotulo_cdb_equiv, valor_cdb_equiv)
+col_b.metric(rotulo_tesouro_equiv, valor_tesouro_equiv)
 
 with st.expander("Detalhes metodológicos"):
     st.markdown(
