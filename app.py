@@ -6,8 +6,8 @@ from datetime import date, timedelta
 from io import BytesIO
 from typing import Any
 
-import altair as alt
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 from bizdays import Calendar
 from reportlab.lib import colors
@@ -336,6 +336,17 @@ def serie_temporal_valor_liquido(
     return pd.DataFrame(linhas)
 
 
+MESES_PT_ABREV = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
+
+
+def gera_ticks_meses_pt(data_inicio: date, data_fim: date) -> tuple[list[pd.Timestamp], list[str]]:
+    """Gera as posições e os rótulos (em português) das marcações mensais do eixo X."""
+    inicio_mes = pd.Timestamp(data_inicio).replace(day=1)
+    ticks = pd.date_range(inicio_mes, data_fim, freq="MS")
+    ticktext = [f"{MESES_PT_ABREV[d.month - 1]}/{d.year}" for d in ticks]
+    return list(ticks), ticktext
+
+
 # =========================================================
 # Geração de relatório em PDF
 # =========================================================
@@ -654,38 +665,30 @@ serie = serie_temporal_valor_liquido(
     aplicar_isencao_selic_10k=aplicar_isencao_selic_10k,
 )
 
-MESES_PT_ABREV = "['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']"
+tickvals, ticktext = gera_ticks_meses_pt(data_inicio, data_fim)
 
-grafico_valor_liquido = (
-    alt.Chart(serie)
-    .mark_line(
-        interpolate="monotone",
-        strokeWidth=1.6,
-        opacity=0.9,
-        point=alt.OverlayMarkDef(size=16, filled=True, opacity=0.55),
+fig_valor_liquido = go.Figure()
+for nome_produto, grupo in serie.groupby("Produto", sort=False):
+    fig_valor_liquido.add_trace(
+        go.Scatter(
+            x=grupo["Data"],
+            y=grupo["Valor Líquido"],
+            name=nome_produto,
+            mode="lines",
+            line=dict(width=1.8, shape="spline", smoothing=0.6),
+            hovertemplate="R$ %{y:,.2f}<extra></extra>",
+        )
     )
-    .encode(
-        x=alt.X(
-            "Data:T",
-            title="Data",
-            axis=alt.Axis(labelExpr=f"{MESES_PT_ABREV}[month(datum.value)] + ' ' + year(datum.value)"),
-        ),
-        y=alt.Y(
-            "Valor Líquido:Q",
-            title="Valor Líquido (R$)",
-            axis=alt.Axis(format=",.2f"),
-            scale=alt.Scale(domainMin=valor_inicial, nice=False),
-        ),
-        color=alt.Color("Produto:N", title="Produto"),
-        tooltip=[
-            alt.Tooltip("Data:T", title="Data", format="%d/%m/%Y"),
-            alt.Tooltip("Produto:N", title="Produto"),
-            alt.Tooltip("Valor Líquido:Q", title="Valor Líquido", format=",.2f"),
-        ],
-    )
-    .properties(height=420)
+
+fig_valor_liquido.update_layout(
+    height=420,
+    hovermode="x unified",
+    legend_title_text="Produto",
+    margin=dict(l=10, r=10, t=10, b=10),
+    yaxis=dict(title="Valor Líquido (R$)", range=[valor_inicial, serie["Valor Líquido"].max() * 1.005], tickformat=",.2f"),
+    xaxis=dict(title="Data", tickmode="array", tickvals=tickvals, ticktext=ticktext, hoverformat="%d/%m/%Y"),
 )
-st.altair_chart(grafico_valor_liquido, use_container_width=True)
+st.plotly_chart(fig_valor_liquido, use_container_width=True)
 
 st.subheader("Equivalência em relação à LCI")
 base_lci = df[df["Produto"] == rotulo_lci].iloc[0]
