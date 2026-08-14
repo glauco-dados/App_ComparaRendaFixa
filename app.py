@@ -7,14 +7,16 @@ from io import BytesIO
 from typing import Any
 
 import pandas as pd
-import plotly.graph_objects as go
+#import plotly.graph_objects as go
 import streamlit as st
-from bizdays import Calendar
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+#from bizdays import Calendar
+#from reportlab.lib import colors
+#from reportlab.lib.pagesizes import A4, landscape
+#from reportlab.lib.styles import getSampleStyleSheet
+#from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+st.title("Teste")
+st.write("Ok")
 st.set_page_config(page_title="Comparador LCI x CDB x Tesouro", layout="wide")
 
 # =========================================================
