@@ -689,8 +689,18 @@ st.altair_chart(grafico_valor_liquido, use_container_width=True)
 
 st.subheader("Equivalência em relação à LCI")
 base_lci = df[df["Produto"] == rotulo_lci].iloc[0]
+
+# A comparação do Tesouro segue o indexador escolhido para a LCI, independentemente
+# do indexador selecionado na seção "Taxas dos produtos" para o Tesouro.
+tipo_tesouro_ref = produto_tesouro
+if modo == "Informar taxa bruta":
+    if indexador_lci == "CDI":
+        tipo_tesouro_ref = "Tesouro Selic"
+    elif indexador_lci == "IPCA+":
+        tipo_tesouro_ref = "Tesouro IPCA+"
+
 cdb_equiv = taxa_bruta_por_taxa_liquida("CDB", base_lci["Taxa Líquida a.a."], valor_inicial, DU, DC, taxa_custodia_aa, produto_tesouro, aplicar_isencao_selic_10k)
-tesouro_equiv = taxa_bruta_por_taxa_liquida("TESOURO", base_lci["Taxa Líquida a.a."], valor_inicial, DU, DC, taxa_custodia_aa, produto_tesouro, aplicar_isencao_selic_10k)
+tesouro_equiv = taxa_bruta_por_taxa_liquida("TESOURO", base_lci["Taxa Líquida a.a."], valor_inicial, DU, DC, taxa_custodia_aa, tipo_tesouro_ref, aplicar_isencao_selic_10k)
 
 rotulo_cdb_equiv = "CDB bruto equivalente à LCI"
 valor_cdb_equiv = formata_pct(cdb_equiv)
@@ -704,17 +714,19 @@ if modo == "Informar taxa bruta" and indexador_lci == "CDI":
     if cdi_aa_ref:
         rotulo_cdb_equiv = "CDB equivalente à LCI"
         valor_cdb_equiv = f"{formata_pct(percentual_sobre_indice(cdb_equiv, cdi_aa_ref))} do CDI"
-        if produto_tesouro == "Tesouro Selic" and "tesouro_selic_taxa" in st.session_state:
-            selic_ref = pct_to_decimal(st.session_state["tesouro_selic_taxa"])
-            rotulo_tesouro_equiv = "Tesouro Selic equivalente à LCI"
-            valor_tesouro_equiv = f"Selic + {formata_pct(spread_sobre_indice(tesouro_equiv, selic_ref))}"
+
+    selic_ref = busca_selic_meta_aa()
+    if selic_ref is None and "tesouro_selic_taxa" in st.session_state:
+        selic_ref = pct_to_decimal(st.session_state["tesouro_selic_taxa"])
+    if selic_ref:
+        rotulo_tesouro_equiv = "Tesouro Selic equivalente à LCI"
+        valor_tesouro_equiv = f"Selic + {formata_pct(spread_sobre_indice(tesouro_equiv, selic_ref))}"
 elif modo == "Informar taxa bruta" and indexador_lci == "IPCA+" and "lci_ipca_est" in st.session_state:
     ipca_ref = pct_to_decimal(st.session_state["lci_ipca_est"])
     rotulo_cdb_equiv = "CDB equivalente à LCI"
     valor_cdb_equiv = f"IPCA + {formata_pct(spread_sobre_indice(cdb_equiv, ipca_ref))}"
-    if produto_tesouro == "Tesouro IPCA+":
-        rotulo_tesouro_equiv = "Tesouro IPCA+ equivalente à LCI"
-        valor_tesouro_equiv = f"IPCA + {formata_pct(spread_sobre_indice(tesouro_equiv, ipca_ref))}"
+    rotulo_tesouro_equiv = "Tesouro IPCA+ equivalente à LCI"
+    valor_tesouro_equiv = f"IPCA + {formata_pct(spread_sobre_indice(tesouro_equiv, ipca_ref))}"
 
 col_a, col_b = st.columns(2)
 col_a.metric(rotulo_cdb_equiv, valor_cdb_equiv)
