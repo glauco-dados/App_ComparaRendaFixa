@@ -34,6 +34,17 @@ IR_REGRESSIVO = [
     (10_000_000, 0.150),
 ]
 
+# Calendário oficial de reuniões do Copom (data da decisão = segundo dia da reunião),
+# conforme divulgado pelo Banco Central. Cobre o horizonte conhecido no momento; períodos
+# além da última data listada são estimados por ciclo de 45 dias (ver calendario_copom_no_periodo).
+CALENDARIO_COPOM_OFICIAL: list[date] = [
+    date(2026, 1, 28), date(2026, 3, 18), date(2026, 4, 29), date(2026, 6, 17),
+    date(2026, 8, 5), date(2026, 9, 16), date(2026, 11, 4), date(2026, 12, 9),
+    date(2027, 1, 27), date(2027, 3, 17), date(2027, 4, 28), date(2027, 6, 16),
+    date(2027, 8, 4), date(2027, 9, 22), date(2027, 10, 27), date(2027, 12, 8),
+]
+CICLO_COPOM_DIAS = 45
+
 
 # =========================================================
 # Utilidades de formatação
@@ -151,6 +162,106 @@ def percentual_sobre_indice(taxa_total_aa: float, indice_aa: float) -> float:
     if indice_aa == 0:
         return 0.0
     return taxa_total_aa / indice_aa
+
+
+def calendario_copom_no_periodo(data_inicio: date, data_fim: date) -> list[tuple[date, bool]]:
+    """Retorna [(data_da_decisao, é_data_oficial)] para reuniões entre data_inicio (exclusive) e data_fim.
+
+    Usa o calendário oficial conhecido; se o período ultrapassar a última data oficial,
+    estima reuniões adicionais a cada CICLO_COPOM_DIAS dias.
+    """
+    reunioes = [(d, True) for d in CALENDARIO_COPOM_OFICIAL if data_inicio < d <= data_fim]
+
+    ultima_conhecida = CALENDARIO_COPOM_OFICIAL[-1]
+    if data_fim > ultima_conhecida:
+        proxima = ultima_conhecida + timedelta(days=CICLO_COPOM_DIAS)
+        while proxima <= data_fim:
+            if proxima > data_inicio:
+                reunioes.append((proxima, False))
+            proxima += timedelta(days=CICLO_COPOM_DIAS)
+
+    return sorted(reunioes, key=lambda item: item[0])
+
+
+def constroi_trajetoria(nivel_inicial: float, ajustes: list[tuple[date, float]]) -> list[tuple[date, float]]:
+    """ajustes: [(data_da_reuniao, delta_decimal)] ordenado por data.
+
+    Retorna um vetor de vigência [(data_a_partir_da_qual_vale, nivel_aa_decimal)], onde o
+    novo nível passa a valer no dia seguinte à decisão do Copom.
+    """
+    trajetoria = [(date.min, nivel_inicial)]
+    nivel = nivel_inicial
+    for data_reuniao, delta in ajustes:
+        nivel += delta
+        trajetoria.append((data_reuniao + timedelta(days=1), nivel))
+    return trajetoria
+
+
+def nivel_na_data(trajetoria: list[tuple[date, float]], d: date) -> float:
+    nivel_atual = trajetoria[0][1]
+    for data_vigencia, nivel in trajetoria:
+        if data_vigencia <= d:
+            nivel_atual = nivel
+        else:
+            break
+    return nivel_atual
+
+
+def retorno_termo(
+    data_inicio: date,
+    data_fim: date,
+    calendario_nome: str,
+    trajetoria: list[tuple[date, float]],
+) -> float:
+    """Compõe o retorno do período percorrendo dia útil a dia útil, aplicando o nível vigente em cada data."""
+    cal = carrega_calendario(calendario_nome)
+    fator = 1.0
+    d = data_inicio
+    while d <= data_fim:
+        if cal.isbizday(data_iso(d)):
+            nivel = nivel_na_data(trajetoria, d)
+            fator *= (1 + nivel) ** (1 / DIAS_UTEIS_ANO)
+        d += timedelta(days=1)
+    return fator - 1
+
+
+def constroi_trajetoria_cdi(trajetoria_selic: list[tuple[date, float]]) -> list[tuple[date, float]]:
+    """Deriva a trajetória do CDI a partir da trajetória da Selic, mantendo o spread atual entre elas."""
+    cdi_atual = busca_cdi_aa()
+    selic_atual = trajetoria_selic[0][1]
+    spread_cdi_selic = (cdi_atual - selic_atual) if cdi_atual is not None else -pct_to_decimal(0.10)
+    return [(d, nivel + spread_cdi_selic) for d, nivel in trajetoria_selic]
+
+
+def rotulo_automatico(tipo: str, indexador_ou_subtipo: str) -> str:
+    if tipo == "TESOURO":
+        return indexador_ou_subtipo
+    return f"{tipo} ({indexador_ou_subtipo})"
+
+
+def _subtipo_key_padrao(key_prefix: str, tipo: str) -> str:
+    return f"{key_prefix}_subtipo_tesouro" if tipo == "TESOURO" else f"{key_prefix}_subtipo_lci_cdb"
+
+
+def _subtipo_default(tipo: str) -> str:
+    return "Tesouro Prefixado" if tipo == "TESOURO" else "CDI"
+
+
+def _atualiza_rotulo_automatico(key_prefix: str) -> None:
+    tipo = st.session_state[f"{key_prefix}_tipo"]
+    subtipo_key = _subtipo_key_padrao(key_prefix, tipo)
+    subtipo = st.session_state.get(subtipo_key, _subtipo_default(tipo))
+    st.session_state[f"{key_prefix}_rotulo"] = rotulo_automatico(tipo, subtipo)
+
+
+def rotulos_unicos(rotulos: list[str]) -> list[str]:
+    """Desambigua rótulos repetidos (ex.: duas ofertas de CDB) anexando '(2)', '(3)' etc."""
+    contagem: dict[str, int] = {}
+    resultado = []
+    for r in rotulos:
+        contagem[r] = contagem.get(r, 0) + 1
+        resultado.append(r if contagem[r] == 1 else f"{r} ({contagem[r]})")
+    return resultado
 
 
 def calcula_custodia_tesouro(
@@ -281,56 +392,63 @@ def taxa_bruta_por_taxa_liquida(
 
 def serie_temporal_valor_liquido(
     valor_inicial: float,
-    taxa_lci: float,
-    taxa_cdb: float,
-    taxa_tesouro: float,
-    rotulo_lci: str,
-    rotulo_cdb: str,
-    rotulo_tesouro: str,
+    produtos_calc: list[dict[str, Any]],
     data_inicio: date,
     data_fim: date,
     calendario_nome: str,
     taxa_custodia_aa: float,
-    produto_tesouro: str,
     aplicar_isencao_selic_10k: bool,
 ) -> pd.DataFrame:
-    """Projeta o valor líquido de resgate dia a dia, para o gráfico de evolução no tempo."""
+    """Projeta o valor líquido de resgate dia a dia, para o gráfico de evolução no tempo.
+
+    `produtos_calc` é uma lista de dicts com as chaves: rotulo, tipo, taxa_aa e,
+    para tipo TESOURO, subtipo (ex.: "Tesouro Selic"). Quando um produto tem a chave
+    opcional "trajetoria" (vetor de vigência no formato de `constroi_trajetoria`), o
+    fator diário é obtido do nível vigente naquela data em vez da taxa_aa fixa.
+    """
     cal = carrega_calendario(calendario_nome)
     taxa_dia_custodia = taxa_custodia_aa / DIAS_UTEIS_ANO
 
-    taxa_dia = {
-        rotulo_lci: (1 + taxa_lci) ** (1 / DIAS_UTEIS_ANO) - 1,
-        rotulo_cdb: (1 + taxa_cdb) ** (1 / DIAS_UTEIS_ANO) - 1,
-        rotulo_tesouro: (1 + taxa_tesouro) ** (1 / DIAS_UTEIS_ANO) - 1,
+    taxa_dia_fixa = {
+        p["rotulo"]: (1 + p["taxa_aa"]) ** (1 / DIAS_UTEIS_ANO) - 1
+        for p in produtos_calc
+        if not p.get("trajetoria")
     }
-    saldo = {nome: valor_inicial for nome in taxa_dia}
-    custodia_acumulada = 0.0
+    saldo = {p["rotulo"]: valor_inicial for p in produtos_calc}
+    custodia_acumulada = {p["rotulo"]: 0.0 for p in produtos_calc if p["tipo"] == "TESOURO"}
 
     linhas: list[dict[str, Any]] = []
     d = data_inicio
     while d <= data_fim:
         if cal.isbizday(data_iso(d)):
-            for nome in saldo:
-                saldo[nome] *= 1 + taxa_dia[nome]
-
-            base_custodia = saldo[rotulo_tesouro]
-            if produto_tesouro == "Tesouro Selic" and aplicar_isencao_selic_10k:
-                base_custodia = max(saldo[rotulo_tesouro] - 10_000, 0)
-            custodia_acumulada += base_custodia * taxa_dia_custodia
-
             aliquota = aliquota_ir(dias_corridos(data_inicio, d))
+            for p in produtos_calc:
+                rotulo = p["rotulo"]
+                trajetoria = p.get("trajetoria")
+                if trajetoria:
+                    fator_dia = (1 + nivel_na_data(trajetoria, d)) ** (1 / DIAS_UTEIS_ANO)
+                else:
+                    fator_dia = 1 + taxa_dia_fixa[rotulo]
+                saldo[rotulo] *= fator_dia
 
-            valor_liquido_lci = saldo[rotulo_lci]
-            valor_liquido_cdb = saldo[rotulo_cdb] - max(saldo[rotulo_cdb] - valor_inicial, 0) * aliquota
-            valor_liquido_tesouro = (
-                saldo[rotulo_tesouro]
-                - max(saldo[rotulo_tesouro] - valor_inicial, 0) * aliquota
-                - custodia_acumulada
-            )
+                if p["tipo"] == "TESOURO":
+                    base_custodia = saldo[rotulo]
+                    if p.get("subtipo") == "Tesouro Selic" and aplicar_isencao_selic_10k:
+                        base_custodia = max(saldo[rotulo] - 10_000, 0)
+                    custodia_acumulada[rotulo] += base_custodia * taxa_dia_custodia
 
-            linhas.append({"Data": d, "Produto": rotulo_lci, "Valor Líquido": valor_liquido_lci})
-            linhas.append({"Data": d, "Produto": rotulo_cdb, "Valor Líquido": valor_liquido_cdb})
-            linhas.append({"Data": d, "Produto": rotulo_tesouro, "Valor Líquido": valor_liquido_tesouro})
+                if p["tipo"] == "LCI":
+                    valor_liquido = saldo[rotulo]
+                elif p["tipo"] == "CDB":
+                    valor_liquido = saldo[rotulo] - max(saldo[rotulo] - valor_inicial, 0) * aliquota
+                else:  # TESOURO
+                    valor_liquido = (
+                        saldo[rotulo]
+                        - max(saldo[rotulo] - valor_inicial, 0) * aliquota
+                        - custodia_acumulada[rotulo]
+                    )
+
+                linhas.append({"Data": d, "Produto": rotulo, "Valor Líquido": valor_liquido})
         d += timedelta(days=1)
 
     return pd.DataFrame(linhas)
@@ -455,7 +573,7 @@ def input_taxa_bruta_lci_cdb(
     return pct_to_decimal(taxa)
 
 
-def input_taxa_bruta_tesouro(coluna, produto_tesouro: str) -> float:
+def input_taxa_bruta_tesouro(coluna, produto_tesouro: str, key_prefix: str) -> float:
     if produto_tesouro == "Tesouro Selic":
         selic_aa = busca_selic_meta_aa()
         if selic_aa is None:
@@ -469,14 +587,14 @@ def input_taxa_bruta_tesouro(coluna, produto_tesouro: str) -> float:
             value=selic_default_pct,
             step=0.05,
             format="%.4f",
-            key="tesouro_selic_taxa",
+            key=f"{key_prefix}_tesouro_selic_taxa",
         )
         spread = coluna.number_input(
             "Tesouro Selic - taxa adicional (%)",
             value=0.0739,
             step=0.0001,
             format="%.4f",
-            key="tesouro_selic_spread",
+            key=f"{key_prefix}_tesouro_selic_spread",
         )
         return taxa_composta(pct_to_decimal(selic_informada), pct_to_decimal(spread))
 
@@ -486,14 +604,14 @@ def input_taxa_bruta_tesouro(coluna, produto_tesouro: str) -> float:
             value=6.00,
             step=0.10,
             format="%.4f",
-            key="tesouro_ipca_pre",
+            key=f"{key_prefix}_tesouro_ipca_pre",
         )
         ipca_estimado = coluna.number_input(
             "Tesouro IPCA+ - IPCA estimado (%)",
             value=4.50,
             step=0.10,
             format="%.4f",
-            key="tesouro_ipca_est",
+            key=f"{key_prefix}_tesouro_ipca_est",
         )
         return taxa_composta(pct_to_decimal(prefixada), pct_to_decimal(ipca_estimado))
 
@@ -502,7 +620,7 @@ def input_taxa_bruta_tesouro(coluna, produto_tesouro: str) -> float:
         value=14.00,
         step=0.10,
         format="%.4f",
-        key="tesouro_pre",
+        key=f"{key_prefix}_tesouro_pre",
     )
     return pct_to_decimal(taxa)
 
@@ -567,6 +685,68 @@ with st.sidebar:
 
     modo = st.radio("Modo de comparação", ["Informar taxa bruta", "Informar taxa líquida desejada"], index=0)
 
+    st.divider()
+    st.subheader("Parâmetro avançado: trajetória Selic (Copom)")
+    usar_trajetoria_copom = st.checkbox(
+        "Estimar decisões do Copom reunião a reunião",
+        value=False,
+        help=(
+            "Substitui a Selic/CDI constante por uma trajetória construída reunião a reunião. "
+            "Aplica-se apenas no modo 'Informar taxa bruta', a produtos indexados a CDI e ao "
+            "Tesouro Selic."
+        ),
+    )
+
+    trajetoria_selic: list[tuple[date, float]] | None = None
+    reunioes_no_periodo: list[tuple[date, bool]] = []
+
+    if usar_trajetoria_copom:
+        reunioes_no_periodo = calendario_copom_no_periodo(data_inicio, data_fim)
+
+        if modo != "Informar taxa bruta":
+            st.caption("A trajetória só é aplicada no modo 'Informar taxa bruta'.")
+        elif not reunioes_no_periodo:
+            st.caption("Nenhuma reunião do Copom prevista no período informado.")
+        else:
+            selic_atual = busca_selic_meta_aa()
+            if selic_atual is None:
+                selic_atual = pct_to_decimal(
+                    st.number_input(
+                        "Selic vigente (%)", value=14.00, step=0.05, format="%.2f", key="copom_selic_base"
+                    )
+                )
+            else:
+                st.caption(f"Selic vigente (Banco Central): {formata_pct(selic_atual)} a.a.")
+
+            st.caption(
+                "Datas sem indicação '(estimada)' vêm do calendário oficial divulgado pelo BC; "
+                "as demais são estimadas por ciclo de 45 dias. O CDI é projetado acompanhando "
+                "integralmente as variações da Selic, mantendo o spread atual entre os dois."
+            )
+
+            if st.button("Zerar cenário de reuniões"):
+                for data_reuniao, _ in reunioes_no_periodo:
+                    st.session_state.pop(f"copom_delta_{data_reuniao.isoformat()}", None)
+                st.rerun()
+
+            ajustes: list[tuple[date, float]] = []
+            nivel_acumulado = selic_atual
+            for data_reuniao, oficial in reunioes_no_periodo:
+                sufixo = "" if oficial else " (estimada)"
+                delta_pct = st.number_input(
+                    f"{data_reuniao:%d/%m/%Y}{sufixo} — variação (p.p.)",
+                    value=0.00,
+                    step=0.25,
+                    format="%.2f",
+                    key=f"copom_delta_{data_reuniao.isoformat()}",
+                )
+                delta = pct_to_decimal(delta_pct)
+                nivel_acumulado += delta
+                ajustes.append((data_reuniao, delta))
+                st.caption(f"Selic projetada após a reunião: {formata_pct(nivel_acumulado)} a.a.")
+
+            trajetoria_selic = constroi_trajetoria(selic_atual, ajustes)
+
 calendario_nome = CALENDARIO_PADRAO
 
 try:
@@ -588,44 +768,151 @@ if DU <= 0:
     st.warning("Informe uma data final posterior à data inicial.")
     st.stop()
 
-st.subheader("Taxas dos produtos")
+trajetoria_cdi_global = constroi_trajetoria_cdi(trajetoria_selic) if trajetoria_selic else None
 
-col1, col2, col3 = st.columns(3)
-indexador_lci = col1.selectbox("Indexador LCI", ["CDI", "Prefixado", "IPCA+"], index=0)
-indexador_cdb = col2.selectbox("Indexador CDB", ["CDI", "Prefixado", "IPCA+"], index=0)
-produto_tesouro = col3.selectbox(
-    "Indexador Tesouro",
-    ["Tesouro Prefixado", "Tesouro IPCA+", "Tesouro Selic"],
-    index=0,
-)
+st.subheader("Produtos comparados")
 
-rotulo_lci = f"LCI ({indexador_lci})"
-rotulo_cdb = f"CDB ({indexador_cdb})"
-rotulo_tesouro = produto_tesouro
+if "produtos" not in st.session_state:
+    st.session_state.produtos = [
+        {"id": 1, "tipo": "LCI"},
+        {"id": 2, "tipo": "CDB"},
+        {"id": 3, "tipo": "TESOURO"},
+    ]
+    st.session_state.proximo_id_produto = 4
 
-if modo == "Informar taxa bruta":
-    taxa_lci = input_taxa_bruta_lci_cdb(
-        col1, "LCI", indexador_lci, "lci",
-        default_pre=12.00, default_pct_cdi=90.00, default_ipca_pre=5.50,
+if st.button("+ Adicionar produto"):
+    novo_id = st.session_state.proximo_id_produto
+    st.session_state.produtos.append({"id": novo_id, "tipo": "CDB"})
+    st.session_state.proximo_id_produto = novo_id + 1
+    st.rerun()
+
+cards: list[dict[str, Any]] = []
+for produto in st.session_state.produtos:
+    pid = produto["id"]
+    key_prefix = f"p{pid}"
+
+    with st.container(border=True):
+        c_tipo, c_rotulo, c_del = st.columns([1, 2.5, 0.7])
+        tipo = c_tipo.selectbox(
+            "Tipo",
+            ["LCI", "CDB", "TESOURO"],
+            index=["LCI", "CDB", "TESOURO"].index(produto["tipo"]),
+            key=f"{key_prefix}_tipo",
+            on_change=_atualiza_rotulo_automatico,
+            args=(key_prefix,),
+        )
+        produto["tipo"] = tipo
+
+        subtipo_key = _subtipo_key_padrao(key_prefix, tipo)
+        if tipo == "TESOURO":
+            subtipo = c_tipo.selectbox(
+                "Título",
+                ["Tesouro Prefixado", "Tesouro IPCA+", "Tesouro Selic"],
+                key=subtipo_key,
+                on_change=_atualiza_rotulo_automatico,
+                args=(key_prefix,),
+            )
+        else:
+            subtipo = c_tipo.selectbox(
+                "Indexador",
+                ["CDI", "Prefixado", "IPCA+"],
+                key=subtipo_key,
+                on_change=_atualiza_rotulo_automatico,
+                args=(key_prefix,),
+            )
+
+        rotulo_key = f"{key_prefix}_rotulo"
+        if rotulo_key not in st.session_state:
+            st.session_state[rotulo_key] = rotulo_automatico(tipo, subtipo)
+        rotulo = c_rotulo.text_input(
+            "Rótulo (identificação da oferta)",
+            key=rotulo_key,
+            help="O rótulo é atualizado automaticamente ao trocar tipo ou indexador; edite livremente para personalizar.",
+        )
+
+        c_del.markdown("&nbsp;")
+        pode_remover = len(st.session_state.produtos) > 1
+        if c_del.button("Remover", key=f"{key_prefix}_remove", disabled=not pode_remover):
+            st.session_state.produtos = [p for p in st.session_state.produtos if p["id"] != pid]
+            st.rerun()
+
+        card_trajetoria = None
+
+        if modo == "Informar taxa bruta":
+            if tipo == "TESOURO":
+                taxa_aa = input_taxa_bruta_tesouro(st, subtipo, key_prefix)
+            else:
+                taxa_aa = input_taxa_bruta_lci_cdb(
+                    st, tipo, subtipo, key_prefix,
+                    default_pre=12.00 if tipo == "LCI" else 14.00,
+                    default_pct_cdi=90.00 if tipo == "LCI" else 100.00,
+                    default_ipca_pre=5.50 if tipo == "LCI" else 6.00,
+                )
+
+            if usar_trajetoria_copom and trajetoria_selic:
+                if tipo in ("LCI", "CDB") and subtipo == "CDI":
+                    percentual_cdi = pct_to_decimal(st.session_state[f"{key_prefix}_pct_cdi"])
+                    trajetoria_produto = [(d, nivel * percentual_cdi) for d, nivel in trajetoria_cdi_global]
+                    retorno = retorno_termo(data_inicio, data_fim, calendario_nome, trajetoria_produto)
+                    taxa_aa = taxa_anual_equivalente(retorno, DU)
+                    card_trajetoria = trajetoria_produto
+                    st.caption(f"Taxa efetiva pela trajetória do Copom: {formata_pct(taxa_aa)} a.a.")
+                elif tipo == "TESOURO" and subtipo == "Tesouro Selic":
+                    spread = pct_to_decimal(st.session_state[f"{key_prefix}_tesouro_selic_spread"])
+                    trajetoria_produto = [(d, taxa_composta(nivel, spread)) for d, nivel in trajetoria_selic]
+                    retorno = retorno_termo(data_inicio, data_fim, calendario_nome, trajetoria_produto)
+                    taxa_aa = taxa_anual_equivalente(retorno, DU)
+                    card_trajetoria = trajetoria_produto
+                    st.caption(f"Taxa efetiva pela trajetória do Copom: {formata_pct(taxa_aa)} a.a.")
+        else:
+            taxa_liq = pct_to_decimal(
+                st.number_input(
+                    "Taxa líquida a.a. (%)",
+                    value=12.00,
+                    step=0.10,
+                    format="%.4f",
+                    key=f"{key_prefix}_liq",
+                )
+            )
+            taxa_aa = taxa_bruta_por_taxa_liquida(
+                tipo,
+                taxa_liq,
+                valor_inicial,
+                DU,
+                DC,
+                taxa_custodia_aa,
+                subtipo if tipo == "TESOURO" else "Tesouro Prefixado",
+                aplicar_isencao_selic_10k,
+            )
+
+    cards.append(
+        {
+            "id": pid,
+            "tipo": tipo,
+            "subtipo": subtipo,
+            "rotulo": rotulo,
+            "taxa_aa": taxa_aa,
+            "trajetoria": card_trajetoria,
+        }
     )
-    taxa_cdb = input_taxa_bruta_lci_cdb(
-        col2, "CDB", indexador_cdb, "cdb",
-        default_pre=14.00, default_pct_cdi=100.00, default_ipca_pre=6.00,
-    )
-    taxa_tesouro = input_taxa_bruta_tesouro(col3, produto_tesouro)
-else:
-    taxa_lci_liq = pct_to_decimal(col1.number_input("LCI - taxa líquida a.a. (%)", value=12.00, step=0.10, format="%.4f"))
-    taxa_cdb_liq = pct_to_decimal(col2.number_input("CDB - taxa líquida a.a. (%)", value=12.00, step=0.10, format="%.4f"))
-    taxa_tesouro_liq = pct_to_decimal(col3.number_input(f"{produto_tesouro} - taxa líquida a.a. (%)", value=12.00, step=0.10, format="%.4f"))
 
-    taxa_lci = taxa_bruta_por_taxa_liquida("LCI", taxa_lci_liq, valor_inicial, DU, DC, taxa_custodia_aa, produto_tesouro, aplicar_isencao_selic_10k)
-    taxa_cdb = taxa_bruta_por_taxa_liquida("CDB", taxa_cdb_liq, valor_inicial, DU, DC, taxa_custodia_aa, produto_tesouro, aplicar_isencao_selic_10k)
-    taxa_tesouro = taxa_bruta_por_taxa_liquida("TESOURO", taxa_tesouro_liq, valor_inicial, DU, DC, taxa_custodia_aa, produto_tesouro, aplicar_isencao_selic_10k)
+rotulos_finais = rotulos_unicos([card["rotulo"] for card in cards])
+for card, rotulo_final in zip(cards, rotulos_finais):
+    card["rotulo"] = rotulo_final
 
 resultados = [
-    calcula_produto("LCI", rotulo_lci, valor_inicial, taxa_lci, DU, DC, taxa_custodia_aa, produto_tesouro, aplicar_isencao_selic_10k),
-    calcula_produto("CDB", rotulo_cdb, valor_inicial, taxa_cdb, DU, DC, taxa_custodia_aa, produto_tesouro, aplicar_isencao_selic_10k),
-    calcula_produto("TESOURO", rotulo_tesouro, valor_inicial, taxa_tesouro, DU, DC, taxa_custodia_aa, produto_tesouro, aplicar_isencao_selic_10k),
+    calcula_produto(
+        card["tipo"],
+        card["rotulo"],
+        valor_inicial,
+        card["taxa_aa"],
+        DU,
+        DC,
+        taxa_custodia_aa,
+        card.get("subtipo", "Tesouro Prefixado"),
+        aplicar_isencao_selic_10k,
+    )
+    for card in cards
 ]
 
 df = pd.DataFrame(resultados).sort_values("Valor Líquido", ascending=False).reset_index(drop=True)
@@ -651,17 +938,11 @@ st.subheader("Gráficos")
 
 serie = serie_temporal_valor_liquido(
     valor_inicial=valor_inicial,
-    taxa_lci=taxa_lci,
-    taxa_cdb=taxa_cdb,
-    taxa_tesouro=taxa_tesouro,
-    rotulo_lci=rotulo_lci,
-    rotulo_cdb=rotulo_cdb,
-    rotulo_tesouro=rotulo_tesouro,
+    produtos_calc=cards,
     data_inicio=data_inicio,
     data_fim=data_fim,
     calendario_nome=calendario_nome,
     taxa_custodia_aa=taxa_custodia_aa,
-    produto_tesouro=produto_tesouro,
     aplicar_isencao_selic_10k=aplicar_isencao_selic_10k,
 )
 
@@ -691,49 +972,87 @@ fig_valor_liquido.update_layout(
 st.plotly_chart(fig_valor_liquido, use_container_width=True)
 
 st.subheader("Equivalência em relação à LCI")
-base_lci = df[df["Produto"] == rotulo_lci].iloc[0]
 
-# A comparação do Tesouro segue o indexador escolhido para a LCI, independentemente
-# do indexador selecionado na seção "Taxas dos produtos" para o Tesouro.
-tipo_tesouro_ref = produto_tesouro
-if modo == "Informar taxa bruta":
-    if indexador_lci == "CDI":
-        tipo_tesouro_ref = "Tesouro Selic"
-    elif indexador_lci == "IPCA+":
-        tipo_tesouro_ref = "Tesouro IPCA+"
+cards_lci = [card for card in cards if card["tipo"] == "LCI"]
 
-cdb_equiv = taxa_bruta_por_taxa_liquida("CDB", base_lci["Taxa Líquida a.a."], valor_inicial, DU, DC, taxa_custodia_aa, produto_tesouro, aplicar_isencao_selic_10k)
-tesouro_equiv = taxa_bruta_por_taxa_liquida("TESOURO", base_lci["Taxa Líquida a.a."], valor_inicial, DU, DC, taxa_custodia_aa, tipo_tesouro_ref, aplicar_isencao_selic_10k)
+if not cards_lci:
+    st.caption("Adicione um produto do tipo LCI para ver a equivalência.")
+else:
+    base_lci = cards_lci[0]
+    base_key_prefix = f"p{base_lci['id']}"
+    taxa_liquida_lci = df.loc[df["Produto"] == base_lci["rotulo"], "Taxa Líquida a.a."].iloc[0]
+    outros_cards = [card for card in cards if card["id"] != base_lci["id"]]
 
-rotulo_cdb_equiv = "CDB bruto equivalente à LCI"
-valor_cdb_equiv = formata_pct(cdb_equiv)
-rotulo_tesouro_equiv = f"{produto_tesouro} bruto equivalente à LCI"
-valor_tesouro_equiv = formata_pct(tesouro_equiv)
+    if not outros_cards:
+        st.caption("Adicione outro produto para comparar a equivalência com a LCI.")
+    else:
+        indexador_lci = base_lci["subtipo"]
 
-if modo == "Informar taxa bruta" and indexador_lci == "CDI":
-    cdi_aa_ref = busca_cdi_aa()
-    if cdi_aa_ref is None and "lci_cdi_manual" in st.session_state:
-        cdi_aa_ref = pct_to_decimal(st.session_state["lci_cdi_manual"])
-    if cdi_aa_ref:
-        rotulo_cdb_equiv = "CDB equivalente à LCI"
-        valor_cdb_equiv = f"{formata_pct(percentual_sobre_indice(cdb_equiv, cdi_aa_ref))} do CDI"
+        # Tesouro segue o indexador da LCI de referência para a bisseção, como no modelo original
+        # (comparação "traduzida" para a linguagem do indexador da LCI, independentemente do
+        # título específico escolhido para cada card de Tesouro).
+        subtipo_tesouro_ref = None
+        if modo == "Informar taxa bruta":
+            if indexador_lci == "CDI":
+                subtipo_tesouro_ref = "Tesouro Selic"
+            elif indexador_lci == "IPCA+":
+                subtipo_tesouro_ref = "Tesouro IPCA+"
 
-    selic_ref = busca_selic_meta_aa()
-    if selic_ref is None and "tesouro_selic_taxa" in st.session_state:
-        selic_ref = pct_to_decimal(st.session_state["tesouro_selic_taxa"])
-    if selic_ref:
-        rotulo_tesouro_equiv = "Tesouro Selic equivalente à LCI"
-        valor_tesouro_equiv = f"Selic + {formata_pct(spread_sobre_indice(tesouro_equiv, selic_ref))}"
-elif modo == "Informar taxa bruta" and indexador_lci == "IPCA+" and "lci_ipca_est" in st.session_state:
-    ipca_ref = pct_to_decimal(st.session_state["lci_ipca_est"])
-    rotulo_cdb_equiv = "CDB equivalente à LCI"
-    valor_cdb_equiv = f"IPCA + {formata_pct(spread_sobre_indice(cdb_equiv, ipca_ref))}"
-    rotulo_tesouro_equiv = "Tesouro IPCA+ equivalente à LCI"
-    valor_tesouro_equiv = f"IPCA + {formata_pct(spread_sobre_indice(tesouro_equiv, ipca_ref))}"
+        cdi_aa_ref = None
+        selic_ref = None
+        ipca_ref = None
 
-col_a, col_b = st.columns(2)
-col_a.metric(rotulo_cdb_equiv, valor_cdb_equiv)
-col_b.metric(rotulo_tesouro_equiv, valor_tesouro_equiv)
+        if modo == "Informar taxa bruta" and indexador_lci == "CDI":
+            cdi_aa_ref = busca_cdi_aa()
+            if cdi_aa_ref is None:
+                manual_key = f"{base_key_prefix}_cdi_manual"
+                if manual_key in st.session_state:
+                    cdi_aa_ref = pct_to_decimal(st.session_state[manual_key])
+
+            selic_ref = busca_selic_meta_aa()
+            if selic_ref is None:
+                for card in outros_cards:
+                    manual_key = f"p{card['id']}_tesouro_selic_taxa"
+                    if manual_key in st.session_state:
+                        selic_ref = pct_to_decimal(st.session_state[manual_key])
+                        break
+        elif modo == "Informar taxa bruta" and indexador_lci == "IPCA+":
+            ipca_key = f"{base_key_prefix}_ipca_est"
+            if ipca_key in st.session_state:
+                ipca_ref = pct_to_decimal(st.session_state[ipca_key])
+
+        colunas_equiv = st.columns(len(outros_cards))
+        for coluna, card in zip(colunas_equiv, outros_cards):
+            tipo = card["tipo"]
+            eh_tesouro = tipo == "TESOURO"
+            subtipo_bissecao = subtipo_tesouro_ref if (eh_tesouro and subtipo_tesouro_ref) else card["subtipo"]
+
+            taxa_equiv = taxa_bruta_por_taxa_liquida(
+                tipo,
+                taxa_liquida_lci,
+                valor_inicial,
+                DU,
+                DC,
+                taxa_custodia_aa,
+                subtipo_bissecao,
+                aplicar_isencao_selic_10k,
+            )
+
+            rotulo_produto = subtipo_tesouro_ref if (eh_tesouro and subtipo_tesouro_ref) else card["rotulo"]
+            rotulo_metric = f"{rotulo_produto} bruto equivalente à LCI"
+            valor_metric = formata_pct(taxa_equiv)
+
+            if cdi_aa_ref and not eh_tesouro:
+                rotulo_metric = f"{card['rotulo']} equivalente à LCI"
+                valor_metric = f"{formata_pct(percentual_sobre_indice(taxa_equiv, cdi_aa_ref))} do CDI"
+            elif selic_ref and eh_tesouro:
+                rotulo_metric = "Tesouro Selic equivalente à LCI"
+                valor_metric = f"Selic + {formata_pct(spread_sobre_indice(taxa_equiv, selic_ref))}"
+            elif ipca_ref:
+                rotulo_metric = f"{rotulo_produto} equivalente à LCI"
+                valor_metric = f"IPCA + {formata_pct(spread_sobre_indice(taxa_equiv, ipca_ref))}"
+
+            coluna.metric(rotulo_metric, valor_metric)
 
 with st.expander("Detalhes metodológicos"):
     st.markdown(
@@ -750,6 +1069,14 @@ with st.expander("Detalhes metodológicos"):
         - **Indexador Selic (Tesouro):** Meta Selic (série SGS 432, buscada automaticamente) composta com a
           taxa adicional (ágio/deságio) informada.
         - **Indexador IPCA+:** taxa prefixada composta com o IPCA estimado informado pelo usuário.
+        - **Trajetória Selic (Copom), parâmetro avançado:** quando ativada, substitui a Selic/CDI
+          constante por uma trajetória construída reunião a reunião do Copom, com ajustes de
+          ±0,25 p.p. (ou múltiplos) informados pelo usuário. O CDI é projetado acompanhando
+          integralmente as variações da Selic, mantendo o spread atual entre os dois. Aplica-se
+          apenas no modo "Informar taxa bruta", a produtos indexados a CDI e ao Tesouro Selic;
+          os demais indexadores não são afetados. As datas das reuniões seguem o calendário
+          oficial divulgado pelo Banco Central quando disponível; além dele, são estimadas por
+          ciclo de 45 dias.
         - **Limitação:** para Tesouro Prefixado/IPCA+ vendido antes do vencimento, o app não modela marcação a mercado.
         """
     )

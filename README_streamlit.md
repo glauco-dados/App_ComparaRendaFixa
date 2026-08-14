@@ -4,7 +4,7 @@ Aplicação em Streamlit para comparar alternativas de renda fixa no mercado bra
 
 ## O que a aplicação faz
 
-- Compara LCI, CDB e Tesouro Direto.
+- Compara um número livre de produtos (LCI, CDB e Tesouro Direto), podendo incluir mais de uma oferta do mesmo tipo — basta clicar em "+ Adicionar produto" e remover o que não precisar.
 - Calcula dias corridos e dias úteis automaticamente.
 - Usa calendário `ANBIMA`, `B3` ou `Actual` via `bizdays`.
 - Permite comparar pela taxa bruta informada.
@@ -12,7 +12,10 @@ Aplicação em Streamlit para comparar alternativas de renda fixa no mercado bra
 - Aplica IR regressivo para CDB e Tesouro.
 - Considera taxa de custódia B3 para Tesouro Direto.
 - Permite aplicar a isenção de custódia de até R$ 10 mil para Tesouro Selic.
-- Exporta o resultado em CSV.
+- Mostra a "Equivalência em relação à LCI": a taxa bruta que cada outro produto precisaria oferecer para igualar a taxa líquida da LCI, sempre traduzida para o indexador da LCI (ex.: se a LCI é CDI, CDB e Tesouro aparecem como "% do CDI" e "Selic + spread", mesmo que o Tesouro tenha sido configurado como Prefixado ou IPCA+).
+- Rótulo de cada produto se atualiza automaticamente ao trocar tipo ou indexador (pode ser personalizado livremente).
+- Parâmetro avançado: trajetória da Selic reunião a reunião do Copom, com ajustes de ±0,25 p.p. por reunião, usada para recalcular as taxas de produtos indexados a CDI e Tesouro Selic (Selic + spread) ao longo do período — em vez de assumir a Selic/CDI constante.
+- Exporta o resultado em CSV e em PDF.
 
 ## Arquivos do projeto
 
@@ -53,6 +56,8 @@ O Streamlit Community Cloud instalará as dependências do `requirements.txt` au
 4. CDB e Tesouro Direto usam tabela regressiva de IR sobre o rendimento.
 5. A taxa de custódia do Tesouro Direto é simulada como provisão diária pró-rata.
 6. Para Tesouro Prefixado e IPCA+ vendido antes do vencimento, o modelo não calcula marcação a mercado.
+7. O calendário de reuniões do Copom está embutido no código (2026 e 2027, conforme divulgado pelo Banco Central); datas além desse horizonte são estimadas por ciclo de 45 dias e precisarão ser atualizadas manualmente quando o BC divulgar novos calendários.
+8. Na trajetória da Selic via Copom, assume-se que o CDI acompanha integralmente as variações da Selic, mantendo o spread atualmente vigente entre os dois.
 
 ## Tabela de IR utilizada
 
@@ -69,8 +74,6 @@ O aplicativo permite carregar o arquivo `TESOURO VS LCI.xlsx` de forma opcional 
 
 ## Próximas melhorias sugeridas
 
-- Adicionar produtos em `% CDI`.
-- Adicionar produtos `IPCA + spread`.
-- Capturar CDI/Selic via API ou Selenium, conforme restrições de rede.
-- Gerar relatório HTML ou PDF para envio ao cliente.
-- Permitir comparação com curva de vencimentos de Tesouro Direto.
+- Marcação a mercado para Tesouro Prefixado/IPCA+ vendido antes do vencimento.
+- Poupança como produto de referência adicional.
+- Comparação com curva de vencimentos de Tesouro Direto (mesmo título, prazos diferentes).
