@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from io import BytesIO
 from typing import Any
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 from bizdays import Calendar
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 st.set_page_config(page_title="Comparador LCI x CDB x Tesouro", layout="wide")
 
@@ -14,6 +20,7 @@ st.set_page_config(page_title="Comparador LCI x CDB x Tesouro", layout="wide")
 # =========================================================
 DIAS_UTEIS_ANO = 252
 TAXA_CUSTODIA_TESOURO_AA_PADRAO = 0.002  # 0,20% a.a.
+CALENDARIO_PADRAO = "ANBIMA"
 
 IR_REGRESSIVO = [
     (180, 0.225),
@@ -42,6 +49,14 @@ def formata_pct(v: float) -> str:
     return f"{v * 100:,.2f}%".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def parse_moeda_brl(texto: str) -> float:
+    limpo = texto.replace("R$", "").strip().replace(".", "").replace(",", ".")
+    try:
+        return float(limpo) if limpo else 0.0
+    except ValueError:
+        return 0.0
+
+
 # =========================================================
 # Calendário financeiro com bizdays
 # =========================================================
@@ -59,15 +74,6 @@ def dias_uteis_bizdays(data_inicio: date, data_fim: date, nome_calendario: str) 
         return 0
     cal = carrega_calendario(nome_calendario)
     return int(cal.bizdays(data_iso(data_inicio), data_iso(data_fim)))
-
-
-def ajustar_data_util(d: date, nome_calendario: str, convencao: str) -> date:
-    cal = carrega_calendario(nome_calendario)
-    if convencao == "Following":
-        return cal.following(data_iso(d))
-    if convencao == "Preceding":
-        return cal.preceding(data_iso(d))
-    return d
 
 
 def dias_corridos(data_inicio: date, data_fim: date) -> int:
@@ -171,11 +177,11 @@ def calcula_produto(
         "Valor Bruto": valor_bruto,
         "Rendimento Bruto": rendimento_bruto,
         "IR": ir,
+        "IR %": aliquota,
         "Custódia B3": custodia,
         "Valor Líquido": valor_liquido,
         "Rendimento Líquido": rendimento_liquido,
         "Taxa Líquida a.a.": taxa_liquida_aa,
-        "IR %": aliquota,
     }
 
 
@@ -220,48 +226,103 @@ def taxa_bruta_por_taxa_liquida(
     return (baixo + alto) / 2
 
 
+def serie_temporal_valor_liquido(
+    valor_inicial: float,
+    taxa_lci: float,
+    taxa_cdb: float,
+    taxa_tesouro: float,
+    data_inicio: date,
+    data_fim: date,
+    calendario_nome: str,
+    taxa_custodia_aa: float,
+    produto_tesouro: str,
+    aplicar_isencao_selic_10k: bool,
+) -> pd.DataFrame:
+    """Projeta o valor líquido de resgate dia a dia, para o gráfico de evolução no tempo."""
+    cal = carrega_calendario(calendario_nome)
+    taxa_dia_custodia = taxa_custodia_aa / DIAS_UTEIS_ANO
+
+    taxa_dia = {
+        "LCI": (1 + taxa_lci) ** (1 / DIAS_UTEIS_ANO) - 1,
+        "CDB": (1 + taxa_cdb) ** (1 / DIAS_UTEIS_ANO) - 1,
+        produto_tesouro: (1 + taxa_tesouro) ** (1 / DIAS_UTEIS_ANO) - 1,
+    }
+    saldo = {nome: valor_inicial for nome in taxa_dia}
+    custodia_acumulada = 0.0
+
+    linhas: list[dict[str, Any]] = []
+    d = data_inicio
+    while d <= data_fim:
+        if cal.isbizday(data_iso(d)):
+            for nome in saldo:
+                saldo[nome] *= 1 + taxa_dia[nome]
+
+            base_custodia = saldo[produto_tesouro]
+            if produto_tesouro == "Tesouro Selic" and aplicar_isencao_selic_10k:
+                base_custodia = max(saldo[produto_tesouro] - 10_000, 0)
+            custodia_acumulada += base_custodia * taxa_dia_custodia
+
+            aliquota = aliquota_ir(dias_corridos(data_inicio, d))
+
+            valor_liquido_lci = saldo["LCI"]
+            valor_liquido_cdb = saldo["CDB"] - max(saldo["CDB"] - valor_inicial, 0) * aliquota
+            valor_liquido_tesouro = (
+                saldo[produto_tesouro]
+                - max(saldo[produto_tesouro] - valor_inicial, 0) * aliquota
+                - custodia_acumulada
+            )
+
+            linhas.append({"Data": d, "Produto": "LCI", "Valor Líquido": valor_liquido_lci})
+            linhas.append({"Data": d, "Produto": "CDB", "Valor Líquido": valor_liquido_cdb})
+            linhas.append({"Data": d, "Produto": produto_tesouro, "Valor Líquido": valor_liquido_tesouro})
+        d += timedelta(days=1)
+
+    return pd.DataFrame(linhas)
+
+
 # =========================================================
-# Leitura opcional do Excel enviado pelo usuário
+# Geração de relatório em PDF
 # =========================================================
-def extrair_numero_apos_rotulo(df: pd.DataFrame, rotulo: str) -> float | None:
-    valores = df.astype(object).values.tolist()
-    linhas = len(valores)
-    colunas = len(valores[0]) if linhas else 0
+def gerar_pdf_comparativo(tabela_exibicao: pd.DataFrame, resumo: dict[str, str]) -> bytes:
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), title="Comparativo LCI x CDB x Tesouro")
+    estilos = getSampleStyleSheet()
 
-    for i in range(linhas):
-        for j in range(colunas):
-            if str(valores[i][j]).strip().lower() == rotulo.lower():
-                candidatos = []
-                if j + 1 < colunas:
-                    candidatos.append(valores[i][j + 1])
-                if i + 1 < linhas:
-                    candidatos.append(valores[i + 1][j])
-                for c in candidatos:
-                    try:
-                        if pd.notna(c):
-                            return float(c)
-                    except Exception:
-                        pass
-    return None
+    elementos = [
+        Paragraph("Comparador LCI x CDB x Tesouro Direto", estilos["Title"]),
+        Paragraph(
+            f"Valor inicial: {resumo['valor_inicial']} &nbsp;|&nbsp; "
+            f"Aplicação: {resumo['data_inicio']} &nbsp;|&nbsp; "
+            f"Vencimento: {resumo['data_fim']} &nbsp;|&nbsp; "
+            f"Dias úteis: {resumo['du']} &nbsp;|&nbsp; "
+            f"Dias corridos: {resumo['dc']} &nbsp;|&nbsp; "
+            f"Alíquota IR: {resumo['aliquota']}",
+            estilos["Normal"],
+        ),
+        Spacer(1, 14),
+    ]
 
+    dados_tabela = [list(tabela_exibicao.columns)] + tabela_exibicao.values.tolist()
+    tabela = Table(dados_tabela, repeatRows=1)
+    tabela.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f3f4f6")]),
+                ("ALIGN", (1, 0), (-1, -1), "CENTER"),
+            ]
+        )
+    )
+    elementos.append(tabela)
+    elementos.append(Spacer(1, 14))
+    elementos.append(Paragraph(resumo["melhor"], estilos["Normal"]))
 
-def carregar_defaults_excel(arquivo) -> dict[str, float]:
-    try:
-        df = pd.read_excel(arquivo, sheet_name=0, header=None, engine="openpyxl")
-    except Exception:
-        return {}
-
-    defaults = {}
-    valor_inicial = extrair_numero_apos_rotulo(df, "Valor Inicial:")
-    if valor_inicial is not None:
-        defaults["valor_inicial"] = valor_inicial
-
-    # Busca a primeira taxa de título encontrada no arquivo como sugestão para Tesouro.
-    taxa_titulo = extrair_numero_apos_rotulo(df, "Taxa do Título:")
-    if taxa_titulo is not None:
-        defaults["taxa_tesouro"] = taxa_titulo * 100
-
-    return defaults
+    doc.build(elementos)
+    return buffer.getvalue()
 
 
 # =========================================================
@@ -269,45 +330,34 @@ def carregar_defaults_excel(arquivo) -> dict[str, float]:
 # =========================================================
 st.title("Comparador LCI x CDB x Tesouro Direto")
 st.caption(
-    "Comparação de rentabilidade líquida com calendário financeiro ANBIMA/B3 via bizdays, "
+    "Comparação de rentabilidade líquida com calendário financeiro ANBIMA, "
     "IR regressivo e taxa de custódia do Tesouro Direto."
 )
 
 with st.sidebar:
-    st.header("Entrada de dados")
-    arquivo_excel = st.file_uploader(
-        "Excel base opcional",
-        type=["xlsx"],
-        help="Você pode carregar a planilha TESOURO VS LCI.xlsx apenas para sugerir alguns valores iniciais.",
-    )
-
-    defaults = carregar_defaults_excel(arquivo_excel) if arquivo_excel else {}
-
-    st.subheader("Calendário")
-    calendario_nome = st.selectbox(
-        "Calendário bizdays",
-        ["ANBIMA", "B3", "Actual"],
-        index=0,
-        help="ANBIMA é o calendário padrão do mercado brasileiro de renda fixa.",
-    )
-    convencao_vencimento = st.selectbox(
-        "Ajuste da data final",
-        ["Nenhum", "Following", "Preceding"],
-        index=0,
-        help="Following ajusta para o próximo dia útil; Preceding ajusta para o dia útil anterior.",
-    )
-
     st.subheader("Parâmetros gerais")
-    valor_inicial = st.number_input(
+
+    if "valor_inicial_input" not in st.session_state:
+        st.session_state.valor_inicial_input = formata_moeda(100000.0)
+
+    def _normaliza_valor_inicial() -> None:
+        valor = parse_moeda_brl(st.session_state.valor_inicial_input)
+        st.session_state.valor_inicial_input = formata_moeda(valor)
+
+    st.text_input(
         "Valor inicial",
-        min_value=0.0,
-        value=float(defaults.get("valor_inicial", 100000.0)),
-        step=1000.0,
-        format="%.2f",
+        key="valor_inicial_input",
+        on_change=_normaliza_valor_inicial,
+        help="Formato: R$ 0.000,00",
     )
-    data_inicio = st.date_input("Data da aplicação", value=date.today())
-    data_fim_original = st.date_input("Data de vencimento/resgate", value=date.today() + timedelta(days=366))
-    data_fim = ajustar_data_util(data_fim_original, calendario_nome, convencao_vencimento)
+    valor_inicial = parse_moeda_brl(st.session_state.valor_inicial_input)
+
+    data_inicio = st.date_input("Data da aplicação", value=date.today(), format="DD/MM/YYYY")
+    data_fim = st.date_input(
+        "Data de vencimento/resgate",
+        value=date.today() + timedelta(days=366),
+        format="DD/MM/YYYY",
+    )
 
     produto_tesouro = st.selectbox(
         "Tipo de Tesouro",
@@ -325,6 +375,8 @@ with st.sidebar:
 
     modo = st.radio("Modo de comparação", ["Informar taxa bruta", "Informar taxa líquida desejada"], index=0)
 
+calendario_nome = CALENDARIO_PADRAO
+
 try:
     DU = dias_uteis_bizdays(data_inicio, data_fim, calendario_nome)
 except Exception as exc:
@@ -333,9 +385,6 @@ except Exception as exc:
 
 DC = dias_corridos(data_inicio, data_fim)
 ALIQUOTA = aliquota_ir(DC)
-
-if data_fim != data_fim_original:
-    st.info(f"Data final ajustada pela convenção {convencao_vencimento}: {data_fim_original:%d/%m/%Y} -> {data_fim:%d/%m/%Y}")
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Dias corridos", DC)
@@ -349,7 +398,7 @@ if DU <= 0:
 
 st.subheader("Taxas dos produtos")
 
-taxa_tesouro_default = float(defaults.get("taxa_tesouro", 14.00))
+taxa_tesouro_default = 14.00
 
 if modo == "Informar taxa bruta":
     col1, col2, col3 = st.columns(3)
@@ -392,11 +441,36 @@ st.success(
 )
 
 st.subheader("Gráficos")
-g1, g2 = st.columns(2)
-with g1:
-    st.bar_chart(df.set_index("Produto")[["Valor Líquido"]])
-with g2:
-    st.bar_chart(df.set_index("Produto")[["Taxa Líquida a.a."]])
+
+serie = serie_temporal_valor_liquido(
+    valor_inicial=valor_inicial,
+    taxa_lci=taxa_lci,
+    taxa_cdb=taxa_cdb,
+    taxa_tesouro=taxa_tesouro,
+    data_inicio=data_inicio,
+    data_fim=data_fim,
+    calendario_nome=calendario_nome,
+    taxa_custodia_aa=taxa_custodia_aa,
+    produto_tesouro=produto_tesouro,
+    aplicar_isencao_selic_10k=aplicar_isencao_selic_10k,
+)
+
+grafico_valor_liquido = (
+    alt.Chart(serie)
+    .mark_line(point=True)
+    .encode(
+        x=alt.X("Data:T", title="Data"),
+        y=alt.Y("Valor Líquido:Q", title="Valor Líquido (R$)", axis=alt.Axis(format=",.2f")),
+        color=alt.Color("Produto:N", title="Produto"),
+        tooltip=[
+            alt.Tooltip("Data:T", title="Data", format="%d/%m/%Y"),
+            alt.Tooltip("Produto:N", title="Produto"),
+            alt.Tooltip("Valor Líquido:Q", title="Valor Líquido", format=",.2f"),
+        ],
+    )
+    .properties(height=420)
+)
+st.altair_chart(grafico_valor_liquido, use_container_width=True)
 
 st.subheader("Equivalência em relação à LCI")
 base_lci = df[df["Produto"] == "LCI"].iloc[0]
@@ -410,7 +484,7 @@ col_b.metric(f"{produto_tesouro} bruto equivalente à LCI", formata_pct(tesouro_
 with st.expander("Detalhes metodológicos"):
     st.markdown(
         """
-        - **Calendário:** cálculo de dias úteis via `bizdays`, com opção ANBIMA, B3 ou Actual.
+        - **Calendário:** cálculo de dias úteis via `bizdays`, sempre pelo calendário ANBIMA.
         - **Base anual:** 252 dias úteis.
         - **LCI:** considerada isenta de IR para pessoa física.
         - **CDB:** IR regressivo sobre o rendimento bruto.
@@ -421,9 +495,36 @@ with st.expander("Detalhes metodológicos"):
     )
 
 csv = df.to_csv(index=False, sep=";", decimal=",", encoding="utf-8-sig")
-st.download_button(
-    "Baixar resultado em CSV",
-    data=csv.encode("utf-8-sig"),
-    file_name="comparativo_lci_cdb_tesouro.csv",
-    mime="text/csv",
+
+pdf_bytes = gerar_pdf_comparativo(
+    styled,
+    {
+        "valor_inicial": formata_moeda(valor_inicial),
+        "data_inicio": f"{data_inicio:%d/%m/%Y}",
+        "data_fim": f"{data_fim:%d/%m/%Y}",
+        "du": str(DU),
+        "dc": str(DC),
+        "aliquota": formata_pct(ALIQUOTA),
+        "melhor": (
+            f"Melhor alternativa pelo valor líquido: {melhor['Produto']} com "
+            f"{formata_moeda(melhor['Valor Líquido'])} e taxa líquida de "
+            f"{formata_pct(melhor['Taxa Líquida a.a.'])} a.a."
+        ),
+    },
 )
+
+col_csv, col_pdf = st.columns(2)
+with col_csv:
+    st.download_button(
+        "Baixar resultado em CSV",
+        data=csv.encode("utf-8-sig"),
+        file_name="comparativo_lci_cdb_tesouro.csv",
+        mime="text/csv",
+    )
+with col_pdf:
+    st.download_button(
+        "Baixar resultado em PDF",
+        data=pdf_bytes,
+        file_name="comparativo_lci_cdb_tesouro.pdf",
+        mime="application/pdf",
+    )
